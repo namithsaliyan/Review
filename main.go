@@ -3,83 +3,199 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 )
 
-// Review represents a review structure
+// Review represents a review submitted by a user
 type Review struct {
+	ID     int    `json:"id"`
 	Name   string `json:"name"`
 	Review string `json:"review"`
+	Rating int    `json:"rating"` // New field to store the rating
 }
 
-// Global variables for storing reviews in-memory
+// Slice to store reviews
 var reviews []Review
+
+// Mutex to synchronize access to the reviews slice
 var mutex = &sync.Mutex{}
 
-func main() {
-	// Set up HTTP routes
-	http.HandleFunc("/reviews", handleReviews)
+// Counter to generate unique IDs for reviews
+var idCounter = 0
 
-	// Start the server
-	fmt.Println("Server is running on http://localhost:8080")
+// File to persist reviews
+const reviewsFile = "reviews.json"
+
+func main() {
+	// Load existing reviews from the file
+	loadReviews()
+
+	http.HandleFunc("/reviews", withCORS(reviewsHandler))
+	http.HandleFunc("/delete-review", withCORS(deleteReviewHandler)) // Handler for deleting a review
+
+	fmt.Println("Server is listening on port 8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// handleReviews handles both GET and POST requests for reviews
-func handleReviews(w http.ResponseWriter, r *http.Request) {
-	// Enable CORS
-	enableCORS(w)
+// withCORS is a middleware function that adds CORS headers
+func withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		
+		// Handle preflight OPTIONS request
+		if r.Method == http.MethodOptions {
+			return
+		}
+		
+		next(w, r)
+	}
+}
 
-	switch r.Method {
-	case http.MethodGet:
-		getReviews(w, r)
-	case http.MethodPost:
-		postReview(w, r)
-	case http.MethodOptions:
-		// Handle pre-flight OPTIONS request
+// loadReviews loads reviews from the file at startup
+func loadReviews() {
+	file, err := ioutil.ReadFile(reviewsFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// File doesn't exist, no reviews to load
+			reviews = []Review{}
+			return
+		}
+		log.Fatalf("Failed to load reviews: %v", err)
+	}
+
+	// Parse JSON data into the reviews slice
+	err = json.Unmarshal(file, &reviews)
+	if err != nil {
+		log.Fatalf("Failed to parse reviews: %v", err)
+	}
+
+	// Set the idCounter to the highest ID found
+	for _, review := range reviews {
+		if review.ID > idCounter {
+			idCounter = review.ID
+		}
+	}
+}
+
+// saveReviews saves the current reviews slice to a file
+func saveReviews() {
+	data, err := json.MarshalIndent(reviews, "", "  ")
+	if err != nil {
+		log.Printf("Failed to marshal reviews: %v", err)
 		return
+	}
+
+	err = ioutil.WriteFile(reviewsFile, data, 0644)
+	if err != nil {
+		log.Printf("Failed to write reviews to file: %v", err)
+	}
+}
+
+// reviewsHandler handles both POST and GET requests for reviews
+func reviewsHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		handlePostReview(w, r)
+	case http.MethodGet:
+		handleGetReviews(w, r)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
-// getReviews handles GET requests to fetch all reviews
-func getReviews(w http.ResponseWriter, r *http.Request) {
-	// Lock mutex to protect reviews slice from concurrent access
-	mutex.Lock()
-	defer mutex.Unlock()
-
-	// Convert reviews slice to JSON
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(reviews)
-}
-
-// postReview handles POST requests to add a new review
-func postReview(w http.ResponseWriter, r *http.Request) {
+// handlePostReview handles the submission of a new review
+func handlePostReview(w http.ResponseWriter, r *http.Request) {
+	// Parse the JSON request body
 	var newReview Review
-
-	// Decode JSON request body into a Review struct
-	err := json.NewDecoder(r.Body).Decode(&newReview)
-	if err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&newReview); err != nil {
 		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	// Lock mutex to protect reviews slice from concurrent access
-	mutex.Lock()
-	reviews = append(reviews, newReview)
-	mutex.Unlock()
+	// Validate the rating value
+	if newReview.Rating < 1 || newReview.Rating > 5 {
+		http.Error(w, "Invalid rating value. Must be between 1 and 5.", http.StatusBadRequest)
+		return
+	}
 
-	// Return success response
+	// Lock the mutex before modifying the slice
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	// Assign a unique ID to the new review
+	idCounter++
+	newReview.ID = idCounter
+
+	reviews = append(reviews, newReview)
+
+	// Save reviews to the file
+	saveReviews()
+
+	// Respond with success and the assigned ID
+	response := map[string]interface{}{"success": true, "id": newReview.ID}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	json.NewEncoder(w).Encode(response)
 }
 
-// enableCORS sets CORS headers to allow cross-origin requests
-func enableCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+// handleGetReviews handles fetching all submitted reviews
+func handleGetReviews(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// Lock the mutex before reading the slice
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	json.NewEncoder(w).Encode(reviews)
+}
+
+// deleteReviewHandler handles the deletion of a review by ID
+func deleteReviewHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse the JSON request body to get the ID of the review to delete
+	var requestData struct {
+		ID int `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&requestData); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	// Lock the mutex before modifying the slice
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	// Find and remove the review with the specified ID
+	index := -1
+	for i, review := range reviews {
+		if review.ID == requestData.ID {
+			index = i
+			break
+		}
+	}
+
+	if index == -1 {
+		http.Error(w, "Review not found", http.StatusNotFound)
+		return
+	}
+
+	// Remove the review from the slice
+	reviews = append(reviews[:index], reviews[index+1:]...)
+
+	// Save reviews to the file
+	saveReviews()
+
+	// Respond with success
+	response := map[string]bool{"success": true}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
